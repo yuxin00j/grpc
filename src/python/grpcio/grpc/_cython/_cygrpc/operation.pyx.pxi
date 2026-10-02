@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
+from libc.string cimport memcpy
+
 
 cdef class Operation:
 
@@ -158,28 +161,48 @@ cdef class ReceiveMessageOperation(Operation):
 
   cdef void un_c(self) except *:
     cdef grpc_byte_buffer_reader message_reader
-    cdef bint message_reader_status
     cdef grpc_slice message_slice
     cdef size_t message_slice_length
-    cdef list chunks = []
+    cdef size_t message_length
+    cdef size_t offset = 0
+    cdef bytes message
+    cdef char *destination
 
-    if self._c_message_byte_buffer != NULL:
-      message_reader_status = grpc_byte_buffer_reader_init(
-          &message_reader, self._c_message_byte_buffer)
-      if message_reader_status:
-        while grpc_byte_buffer_reader_next(&message_reader, &message_slice):
-          message_slice_length = grpc_slice_length(message_slice)
-          if message_slice_length > 0:
-            chunks.append((<char *>grpc_slice_start_ptr(message_slice))[:message_slice_length])
-          grpc_slice_unref(message_slice)
-
+    self._message = None
+    if self._c_message_byte_buffer == NULL:
+      return
+    try:
+      if not grpc_byte_buffer_reader_init(
+          &message_reader, self._c_message_byte_buffer):
+        return
+      try:
+        # Allocate the result once and copy every slice straight into it
+        # without the GIL instead of materializing a bytes object per slice
+        # and joining them afterwards. The reader iterates buffer_out, so
+        # size the result from that buffer (as grpc_byte_buffer_reader_readall
+        # does) rather than from the possibly compressed input buffer.
+        message_length = grpc_byte_buffer_length(message_reader.buffer_out)
+        message = PyBytes_FromStringAndSize(NULL, message_length)
+        destination = PyBytes_AS_STRING(message)
+        with nogil:
+          while grpc_byte_buffer_reader_next(&message_reader, &message_slice):
+            message_slice_length = grpc_slice_length(message_slice)
+            if offset + message_slice_length <= message_length:
+              memcpy(destination + offset,
+                     grpc_slice_start_ptr(message_slice),
+                     message_slice_length)
+            offset += message_slice_length
+            grpc_slice_unref(message_slice)
+      finally:
         grpc_byte_buffer_reader_destroy(&message_reader)
-        self._message = b"".join(chunks)
+      if offset == message_length:
+        self._message = message
       else:
-        self._message = None
+        _LOGGER.error(
+            "Received message of %d bytes does not match its byte buffer "
+            "length of %d bytes; dropping it.", offset, message_length)
+    finally:
       grpc_byte_buffer_destroy(self._c_message_byte_buffer)
-    else:
-      self._message = None
 
   def message(self):
     return self._message
